@@ -22,6 +22,5 @@ jobs:
         run: >
           C:\Tosca_Projects\ToscaCI\Client\ToscaCIClient.exe
           -m distributed
-          -c "C:\Tosca_Projects\ToscaCI\Client\TFS_ERP.xml"
-          -c "C:\Tosca_Projects\ToscaCI\Client\GIT_INTEGRATION.xml"
+          -c "C:\Tosca_Projects\ToscaCI\Client\EMI.xml"
           -r "C:\Tosca_Projects\Automation\Result.xml"
