@@ -1,0 +1,26 @@
+name: EMI_Regression
+ 
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+  #####Job Schedule############################
+  schedule:
+  # Runs Tuesday at 3:00 PM IST (09:30 UTC)
+  - cron: '30 1 * * 1,2,3,4,5'
+  ##########################################################
+jobs:
+  build:
+    runs-on: [self-hosted, windows]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+ 
+      - name: Run TOSCA Test
+        run: >
+          C:\Tosca_Projects\ToscaCI\Client\ToscaCIClient.exe
+          -m distributed
+          -c "C:\Tosca_Projects\ToscaCI\Client\EMI.xml"
+          -r "C:\Tosca_Projects\Automation\Result.xml"
