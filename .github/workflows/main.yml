@@ -1,5 +1,5 @@
 name: EMI_Regression
- 
+
 on:
   push:
     branches: ["main"]
@@ -17,10 +17,394 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
- 
+
       - name: Run TOSCA Test
         run: >
           C:\Tosca_Projects\ToscaCI\Client\ToscaCIClient.exe
           -m distributed
           -c "C:\Tosca_Projects\ToscaCI\Client\EMI.xml"
           -r "C:\Tosca_Projects\Automation\Result.xml"
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Unit Test Results
+          path: C:\Tosca_Projects\Automation\Result.xml
+
+      - name: Parse summary and insert into Postgres (PowerShell, robust)
+        id: save_results
+        shell: powershell
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          DB_TABLE: ${{ secrets.DB_TABLE }}
+          # Optional: set EDP_DETAIL and KPI_TABLE in repo secrets if needed
+          # EDP_DETAIL: ${{ secrets.EDP_DETAIL }}
+          # KPI_TABLE: ${{ secrets.KPI_TABLE }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Starting parse & DB insert step"
+
+          # collect files to cleanup in finally
+          $tmpFiles = @()
+
+          function Set-GHAOutputs {
+            param($tests, $failures, $errors, $skipped, $pass)
+            Add-Content -Path $env:GITHUB_OUTPUT -Value ("TestsRun={0}" -f $tests)
+            Add-Content -Path $env:GITHUB_OUTPUT -Value ("Failures={0}" -f $failures)
+            Add-Content -Path $env:GITHUB_OUTPUT -Value ("Errors={0}" -f $errors)
+            Add-Content -Path $env:GITHUB_OUTPUT -Value ("Skipped={0}" -f $skipped)
+            Add-Content -Path $env:GITHUB_OUTPUT -Value ("Pass={0}" -f $pass)
+          }
+
+          # helpers for SQL escaping/formatting
+          function Escape-SqlString($s) {
+            if ($null -eq $s) { return "NULL" }
+            $str = [string]$s
+            $str = $str -replace "'", "''"
+            return "'" + $str + "'"
+          }
+          function Format-SqlValue($v) {
+            if ($null -eq $v) { return "NULL" }
+            try { $typeName = $v.GetType().Name } catch { return Escape-SqlString($v) }
+            switch ($typeName) {
+              "Int32" { return $v.ToString() }
+              "Int64" { return $v.ToString() }
+              "Double" { return $v.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
+              "Decimal" { return $v.ToString([System.Globalization.CultureInfo]::InvariantCulture) }
+              "DateTime" { return Escape-SqlString($v.ToString("yyyy-MM-dd HH:mm:ss")) }
+              Default { return Escape-SqlString($v) }
+            }
+          }
+
+          # helper to quote schema.table or table to "schema"."table" or "table"
+          function Quote-Identifier($identifier) {
+            $s = [string]$identifier
+            if ($s -match '\.') {
+              $parts = $s.Split('.')
+              return '"' + $parts[0].Trim('"') + '"."' + $parts[1].Trim('"') + '"'
+            } else {
+              return '"' + $s.Trim('"') + '"'
+            }
+          }
+
+          # - locate result xml
+          $resultPath = 'C:\Tosca_Projects\Automation\Result.xml'
+          if (-not (Test-Path $resultPath)) {
+            Write-Host "Result XML not found at $resultPath"
+            Set-GHAOutputs 0 0 0 0 0
+            Exit 0
+          }
+          Write-Host "Parsing result file: $resultPath"
+
+          # load xml
+          try {
+            [xml]$doc = Get-Content -Path $resultPath -Raw
+          } catch {
+            Write-Error "Failed to load XML: $_"
+            Set-GHAOutputs 0 0 0 0 0
+            Exit 3
+          }
+
+          # find testsuites
+          $suites = $doc.SelectNodes("//testsuite")
+          if (-not $suites -or $suites.Count -eq 0) {
+            if ($doc.DocumentElement -and $doc.DocumentElement.Name -eq 'testsuite') {
+              $suites = ,$doc.DocumentElement
+            } else {
+              Write-Host "No <testsuite> elements found in XML."
+              Set-GHAOutputs 0 0 0 0 0
+              Exit 0
+            }
+          }
+
+          # aggregate totals
+          $totalTests=0; $totalFailures=0; $totalSkipped=0; $totalErrors=0
+          foreach ($ts in $suites) {
+            $ts_tests=0; $ts_failures=0; $ts_skipped=0; $ts_errors=0
+            if ($ts.HasAttribute('tests')) { [int]::TryParse($ts.GetAttribute('tests'), [ref]$ts_tests) > $null }
+            if ($ts.HasAttribute('failures')) { [int]::TryParse($ts.GetAttribute('failures'), [ref]$ts_failures) > $null }
+            if ($ts.HasAttribute('skipped')) { [int]::TryParse($ts.GetAttribute('skipped'), [ref]$ts_skipped) > $null }
+            if ($ts.HasAttribute('errors')) { [int]::TryParse($ts.GetAttribute('errors'), [ref]$ts_errors) > $null }
+            $totalTests += $ts_tests
+            $totalFailures += $ts_failures
+            $totalSkipped += $ts_skipped
+            $totalErrors += $ts_errors
+          }
+          $totalPass = $totalTests - $totalFailures - $totalSkipped - $totalErrors
+          if ($totalPass -lt 0) { $totalPass = 0 }
+
+          Write-Host "Aggregated: TestsRun=$totalTests Failures=$totalFailures Errors=$totalErrors Skipped=$totalSkipped Pass=$totalPass"
+          Set-GHAOutputs $totalTests $totalFailures $totalErrors $totalSkipped $totalPass
+
+          # prepare aggregated insert SQL and tmp file
+          $src = "Git-exec-Result.xml"
+          $cicd = "Git-Tosca"
+          $aggSql = "INSERT INTO $($env:DB_TABLE) (run_timestamp, tests_run, failures, errors, skipped, pass_count, source_file, cicd_pipe) VALUES (CURRENT_TIMESTAMP, $totalTests, $totalFailures, $totalErrors, $totalSkipped, $totalPass, '$src', '$cicd');"
+          $aggTmpFile = Join-Path -Path $env:TEMP -ChildPath ("tmp_agg_insert_{0}.sql" -f ([Guid]::NewGuid().ToString()))
+          $aggSql | Out-File -FilePath $aggTmpFile -Encoding ascii -Force
+          $tmpFiles += $aggTmpFile
+          Write-Host "Prepared aggregated SQL at: $aggTmpFile"
+
+          # tables (from env or defaults)
+          $edp_detail = $env:EDP_DETAIL
+          if (-not $edp_detail -or $edp_detail.Trim() -eq "") { $edp_detail = "edp4s_detail" }
+          $kpi_table = $env:KPI_TABLE
+          if (-not $kpi_table -or $kpi_table.Trim() -eq "") { $kpi_table = "aad_automation_kpi_emi" }
+
+          $edp_detail_sql = Quote-Identifier $edp_detail
+          $kpi_table_sql = Quote-Identifier $kpi_table
+
+          # collect structured rows (no SQL rendering yet)
+          $detailRows = @()
+          $kpiRows = @()
+
+          foreach ($ts in $suites) {
+            $ts_name = if ($ts.HasAttribute('name')) { $ts.GetAttribute('name') } elseif ($ts.Attributes['name']) { $ts.Attributes['name'].Value } else { $null }
+            $ts_tests = 0; $ts_failures = 0; $ts_skipped = 0; $ts_errors = 0
+            if ($ts.HasAttribute('tests')) { [int]::TryParse($ts.GetAttribute('tests'), [ref]$ts_tests) > $null }
+            if ($ts.HasAttribute('failures')) { [int]::TryParse($ts.GetAttribute('failures'), [ref]$ts_failures) > $null }
+            if ($ts.HasAttribute('skipped')) { [int]::TryParse($ts.GetAttribute('skipped'), [ref]$ts_skipped) > $null }
+            if ($ts.HasAttribute('errors')) { [int]::TryParse($ts.GetAttribute('errors'), [ref]$ts_errors) > $null }
+            $ts_time = if ($ts.HasAttribute('time')) { $ts.GetAttribute('time') } else { $null }
+            $ts_timestamp = if ($ts.HasAttribute('timestamp')) { $ts.GetAttribute('timestamp') } else { $null }
+            # exec_serial if present on testsuite
+            $exec_serial = if ($ts.HasAttribute('exec_serial')) { $ts.GetAttribute('exec_serial') } else { $null }
+
+            $ts_pass = $ts_tests - $ts_failures - $ts_skipped - $ts_errors
+            if ($ts_pass -lt 0) { $ts_pass = 0 }
+
+            $ts_dt = $null
+            if ($ts_timestamp) {
+              try { $ts_dt = [DateTime]::Parse($ts_timestamp) } catch { $ts_dt = $null }
+            }
+
+            $testcases = $ts.SelectNodes("testcase")
+            if (-not $testcases -or $testcases.Count -eq 0) { $testcases = $ts.SelectNodes(".//testcase") }
+
+            foreach ($tc in $testcases) {
+              $tc_name = if ($tc.HasAttribute('name')) { $tc.GetAttribute('name') } elseif ($tc.Attributes['name']) { $tc.Attributes['name'].Value } else { $null }
+              $tc_time = if ($tc.HasAttribute('time')) { $tc.GetAttribute('time') } else { $null }
+              $tc_timestamp = if ($tc.HasAttribute('timestamp')) { $tc.GetAttribute('timestamp') } else { $null }
+
+              # logs
+              $tc_log = $null
+              if ($tc.HasAttribute('log')) { $tc_log = $tc.GetAttribute('log') }
+              if (-not $tc_log) { $so = $tc.SelectSingleNode("system-out"); if ($so -and $so.InnerText) { $tc_log = $so.InnerText } }
+              if (-not $tc_log) { $se = $tc.SelectSingleNode("system-err"); if ($se -and $se.InnerText) { $tc_log = $se.InnerText } }
+              if (-not $tc_log) { $ln = $tc.SelectSingleNode("log"); if ($ln -and $ln.InnerText) { $tc_log = $ln.InnerText } }
+
+              # parse times/durations
+              $tc_time_value = $null
+              if ($tc_time -ne $null) {
+                $tmpDec = 0
+                if ([decimal]::TryParse($tc_time, [ref]$tmpDec)) { $tc_time_value = $tmpDec } else { $tc_time_value = $tc_time }
+              }
+
+              $tc_exec_duration = $null
+              if ($ts_dt -ne $null -and $tc_timestamp) {
+                try {
+                  $tc_dt = [DateTime]::Parse($tc_timestamp)
+                  $ts_minus_tc = $ts_dt - $tc_dt
+                  $tc_exec_duration = [decimal]$ts_minus_tc.TotalSeconds
+                } catch { $tc_exec_duration = $null }
+              }
+
+              # collect detail row (run_candidate = exec_serial if present)
+              $detailRows += [PSCustomObject]@{
+                testsuit_name = $ts_name
+                testsuit_tests = $ts_tests
+                testsuit_failures = $ts_failures
+                testsuit_skipped = $ts_skipped
+                testsuit_time = $ts_time
+                testsuit_timestamp = $ts_timestamp
+                testsuit_passed = $ts_pass
+                testcase_name = $tc_name
+                testcase_time = $tc_time_value
+                testcase_timestamp = $tc_timestamp
+                tc_exec_duration = $tc_exec_duration
+                testcase_log = $tc_log
+                run_candidate = $exec_serial
+              }
+
+              # KPI row: status per requirement (ts_pass == 1 => passed, else failed)
+              $kpiRows += [PSCustomObject]@{
+                run_candidate = $exec_serial
+                feature_name = $ts_name
+                scenario_name = $tc_name
+                status = if ($ts_pass -eq 1) { 'passed' } else { 'failed' }
+                error = $tc_log
+                duration = $tc_time_value
+              }
+            }
+          }
+
+          Write-Host ("Collected detail rows: {0}" -f $detailRows.Count)
+          Write-Host ("Collected KPI rows: {0}" -f $kpiRows.Count)
+
+          # find psql executable
+          function Find-PSQL {
+            $cmd = Get-Command psql -ErrorAction SilentlyContinue
+            if ($cmd) { return $cmd.Source }
+            $candidates = Get-ChildItem -Path "C:\Program Files\PostgreSQL" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+              Get-ChildItem -Path $_.FullName -Recurse -Filter psql.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+            } | Where-Object { $_ }
+            if ($candidates) { return $candidates | Select-Object -First 1 }
+            $candidates2 = Get-ChildItem -Path "C:\Program Files (x86)\PostgreSQL" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+              Get-ChildItem -Path $_.FullName -Recurse -Filter psql.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName -First 1
+            } | Where-Object { $_ }
+            if ($candidates2) { return $candidates2 | Select-Object -First 1 }
+            return $null
+          }
+
+          # ===== MAIN psql branch (preferred) =====
+          $psqlPath = Find-PSQL
+          if (-not $psqlPath) {
+            Write-Error "psql not found on runner. Please install PostgreSQL client or enable the Npgsql fallback."
+            Exit 20
+          }
+
+          try {
+            Write-Host ("psql found at: {0}" -f $psqlPath)
+            $env:PGPASSWORD = $env:DB_PASS
+
+            # run aggregated insert first
+            Write-Host "Executing aggregated insert..."
+            & $psqlPath -h $env:DB_HOST -p $env:DB_PORT -U $env:DB_USER -d $env:DB_NAME -f $aggTmpFile
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "Aggregated insert failed with exit code $LASTEXITCODE"
+              Get-Content -Path $aggTmpFile | ForEach-Object { Write-Host $_ }
+              Exit $LASTEXITCODE
+            }
+            Remove-Item -Path $aggTmpFile -Force -ErrorAction SilentlyContinue
+            $tmpFiles = $tmpFiles | Where-Object { $_ -ne $aggTmpFile }  # remove from cleanup list
+            Write-Host "Aggregated row inserted."
+
+            # resolve DB run id (if exec_serial not present)
+            $runId = $null
+            try {
+              $runIdRaw = & $psqlPath -h $env:DB_HOST -p $env:DB_PORT -U $env:DB_USER -d $env:DB_NAME -At -c "SELECT id FROM $($env:DB_TABLE) ORDER BY run_timestamp DESC LIMIT 1;"
+              if ($runIdRaw) { $runId = $runIdRaw.Trim() }
+              Write-Host ("Resolved run id from DB: {0}" -f $runId)
+            } catch {
+              Write-Warning "Unable to resolve run id: $_"
+            }
+
+            # render detail tuples (append resolved run_id or exec_serial)
+            $detailTuples = @()
+            foreach ($dr in $detailRows) {
+              $ridVal = $dr.run_candidate
+              if (-not $ridVal -and $runId) { $ridVal = $runId }
+              $ridSql = "NULL"
+              if ($ridVal) {
+                $tmpInt = 0
+                if ([int]::TryParse($ridVal, [ref]$tmpInt)) { $ridSql = $ridVal } else { $ridSql = Escape-SqlString($ridVal) }
+              }
+
+              $vals = @()
+              $vals += Escape-SqlString($dr.testsuit_name)
+              $vals += Format-SqlValue($dr.testsuit_tests)
+              $vals += Format-SqlValue($dr.testsuit_failures)
+              $vals += Format-SqlValue($dr.testsuit_skipped)
+              $vals += Escape-SqlString($dr.testsuit_time)
+              $vals += Escape-SqlString($dr.testsuit_timestamp)
+              $vals += Format-SqlValue($dr.testsuit_passed)
+              $vals += Escape-SqlString($dr.testcase_name)
+              $vals += Format-SqlValue($dr.testcase_time)
+              $vals += Escape-SqlString($dr.testcase_timestamp)
+              $vals += Format-SqlValue($dr.tc_exec_duration)
+              $vals += Escape-SqlString($dr.testcase_log)
+              $vals += $ridSql
+
+              $detailTuples += "(" + ($vals -join ", ") + ")"
+            }
+
+            $detailTmpFile = $null
+            if ($detailTuples.Count -gt 0) {
+              $detailColumns = "testsuit_name,testsuit_tests,testsuit_failures,testsuit_skipped,testsuit_time,testsuit_timestamp,testsuit_passed,testcase_name,testcase_time,testcase_timestamp,tc_exec_duration,testcase_log,run_id"
+              $detailInsert = "INSERT INTO " + $edp_detail_sql + " ($detailColumns) VALUES `n" + ($detailTuples -join ",`n") + ";"
+              $detailTmpFile = Join-Path -Path $env:TEMP -ChildPath ("tmp_detail_insert_{0}.sql" -f ([Guid]::NewGuid().ToString()))
+              $detailInsert | Out-File -FilePath $detailTmpFile -Encoding utf8 -Force
+              $tmpFiles += $detailTmpFile
+              Write-Host "Prepared detail SQL at: $detailTmpFile"
+            } else {
+              Write-Host "No detail rows to insert."
+            }
+
+            # execute detail insert
+            if ($detailTmpFile -and (Test-Path $detailTmpFile)) {
+              Write-Host "Executing detail insert..."
+              & $psqlPath -h $env:DB_HOST -p $env:DB_PORT -U $env:DB_USER -d $env:DB_NAME -f $detailTmpFile
+              if ($LASTEXITCODE -ne 0) {
+                Write-Error "Detail insert returned exit code $LASTEXITCODE"
+                Get-Content -Path $detailTmpFile | ForEach-Object { Write-Host $_ }
+              } else {
+                Write-Host "Detail rows inserted."
+              }
+              Remove-Item -Path $detailTmpFile -Force -ErrorAction SilentlyContinue
+              $tmpFiles = $tmpFiles | Where-Object { $_ -ne $detailTmpFile }
+            }
+
+            # prepare KPI tuples
+            if ($kpiRows.Count -gt 0) {
+              $kpiTuplesForSql = @()
+              foreach ($kr in $kpiRows) {
+                $ridVal = $kr.run_candidate
+                if (-not $ridVal -and $runId) { $ridVal = $runId }
+                $ridSql = "NULL"
+                if ($ridVal) {
+                  $tmpInt = 0
+                  if ([int]::TryParse($ridVal, [ref]$tmpInt)) { $ridSql = $ridVal } else { $ridSql = Escape-SqlString($ridVal) }
+                }
+
+                $fNm = Escape-SqlString($kr.feature_name)
+                $sNm = Escape-SqlString($kr.scenario_name)
+                $st = Escape-SqlString($kr.status)
+                $err = Escape-SqlString($kr.error)
+                $dur = Format-SqlValue($kr.duration)
+
+                $kpiTuple = "(" + ($ridSql + ", " + $fNm + ", " + $sNm + ", " + $st + ", " + $err + ", " + $dur + ", CURRENT_TIMESTAMP") + ")"
+                $kpiTuplesForSql += $kpiTuple
+              }
+
+              if ($kpiTuplesForSql.Count -gt 0) {
+                $kpiColumns = '"Run ID","Feature Name","Scenario Name","Status","Error","Duration","Executed On"'
+                $kpiInsertStatement = "INSERT INTO " + $kpi_table_sql + " (" + $kpiColumns + ") VALUES `n" + ($kpiTuplesForSql -join ",`n") + ";"
+                $kpiTmpFile = Join-Path -Path $env:TEMP -ChildPath ("tmp_kpi_insert_{0}.sql" -f ([Guid]::NewGuid().ToString()))
+                $kpiInsertStatement | Out-File -FilePath $kpiTmpFile -Encoding utf8 -Force
+                $tmpFiles += $kpiTmpFile
+
+                Write-Host "Prepared KPI SQL at: $kpiTmpFile"
+                # safer preview length
+                $preview = Get-Content -Path $kpiTmpFile -Raw
+                if ($preview.Length -gt 512) { $preview = $preview.Substring(0,512) + "...(truncated)" }
+                Write-Host "KPI SQL preview (first 512 chars):"
+                Write-Host $preview
+
+                Write-Host "Executing KPI insert..."
+                & $psqlPath -h $env:DB_HOST -p $env:DB_PORT -U $env:DB_USER -d $env:DB_NAME -f $kpiTmpFile
+                if ($LASTEXITCODE -ne 0) {
+                  Write-Error "KPI insert returned exit code $LASTEXITCODE"
+                  Get-Content -Path $kpiTmpFile | ForEach-Object { Write-Host $_ }
+                } else {
+                  Write-Host "KPI rows inserted via psql."
+                }
+                Remove-Item -Path $kpiTmpFile -Force -ErrorAction SilentlyContinue
+                $tmpFiles = $tmpFiles | Where-Object { $_ -ne $kpiTmpFile }
+              } else {
+                Write-Host "No KPI tuples were created."
+              }
+            } else {
+              Write-Host "No KPI rows to insert."
+            }
+
+            Write-Host "All psql inserts done."
+            Exit 0
+          } finally {
+            # cleanup any tmp files that remain
+            foreach ($f in $tmpFiles) { if (Test-Path $f) { Remove-Item -Path $f -Force -ErrorAction SilentlyContinue } }
+          }
